@@ -718,6 +718,11 @@ impl InnerHandle {
             ptr: std::ptr::null_mut(),
         }));
 
+        // libwayland announces the global to existing clients from inside
+        // `wl_global_create`, before it is in `known_globals`: mark it as
+        // ours so `global_filter` asks its handler instead of showing it to
+        // everyone.
+        GLOBAL_UNDER_CONSTRUCTION.with(|g| g.set(udata as *mut c_void));
         let ret = HANDLE.set(&(self.state.clone(), std::ptr::null_mut()), || unsafe {
             ffi_dispatch!(
                 wayland_server_handle(),
@@ -729,6 +734,7 @@ impl InnerHandle {
                 global_bind::<D>
             )
         });
+        GLOBAL_UNDER_CONSTRUCTION.with(|g| g.set(std::ptr::null_mut()));
 
         if ret.is_null() {
             // free the user data as global creation failed
@@ -1450,6 +1456,13 @@ unsafe extern "C" fn global_bind<D: 'static>(
     })
 }
 
+thread_local! {
+    /// The user data of the global `create_global` is creating, while
+    /// `wl_global_create` runs.
+    static GLOBAL_UNDER_CONSTRUCTION: std::cell::Cell<*mut c_void> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
 unsafe extern "C" fn global_filter<D: 'static>(
     client: *const wl_client,
     global: *const wl_global,
@@ -1468,7 +1481,16 @@ unsafe extern "C" fn global_filter<D: 'static>(
         let guard = state_arc.lock().unwrap();
         guard.is_known_global(global)
     });
-    if !is_known_global {
+    // A global being created by us is not known yet, but it is ours.
+    let is_under_construction = GLOBAL_UNDER_CONSTRUCTION.with(|g| {
+        let pending = g.get();
+        !pending.is_null()
+            && std::ptr::eq(
+                ffi_dispatch!(wayland_server_handle(), wl_global_get_user_data, global),
+                pending,
+            )
+    });
+    if !is_known_global && !is_under_construction {
         return true;
     }
 
